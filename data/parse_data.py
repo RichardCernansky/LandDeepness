@@ -1,30 +1,22 @@
 import os
 import json
-import glob
 import cv2
 import numpy as np
-from osgeo import gdal
 
-#hyperparms list:
-    #target_size
-    #stride
-    #radius (of the masking circle)
+# Hyperparameters
+TARGET_SIZE = 512  # Tile size
+STRIDE = 256  # Stride for tiling
+RADIUS = 5  # Radius for the mask circle
 
-# parent directory containing observation folders
+# Directories
 OBSERVATION_DIR = "./observations"
 OUTPUT_DIR = "./processed_observations"
 
-GSDDSM_TIF_FILE = "gsddsm.tif"
-GSDDSM_TFW_FILE = "gsddsm.tfw"
+GSDDSM_TIF_FILE = "HL1.tif"
+GSDDSM_TFW_FILE = "segment.tfw"
 CENTERS_JSON_FILE = "tree_info.json"
 
-def read_tif_with_gdal(tif_path):
-    dataset = gdal.Open(tif_path)
-    if not dataset:
-        raise ValueError(f"Unable to read TIF file: {tif_path}")
-    return dataset.ReadAsArray()
 
-# function to parse .tfw file
 def parse_tfw(tfw_path: str):
     with open(tfw_path, 'r') as f:
         lines = f.readlines()
@@ -34,52 +26,50 @@ def parse_tfw(tfw_path: str):
     upper_left_y = float(lines[5].strip())
     return x_scale, y_scale, upper_left_x, upper_left_y
 
-# function to generate mask from JSON center_list
+
 def generate_mask(tif_path: str, tfw_path: str, json_path: str, output_mask_path: str):
+    """
+    Generate a mask based on center coordinates and save as a JPEG image.
+    """
     x_scale, y_scale, upper_left_x, upper_left_y = parse_tfw(tfw_path)
-    tif_image = read_tif_with_gdal(tif_path)
+
+    # Read the .tif file using OpenCV
+    tif_image = cv2.imread(tif_path, cv2.IMREAD_UNCHANGED)
+    if tif_image is None:
+        raise ValueError(f"Unable to read TIF file: {tif_path}")
+
+    # Mask should match spatial dimensions of the input image
     mask = np.zeros(tif_image.shape[:2], dtype=np.uint8)
 
     with open(json_path, 'r') as f:
         center_data = json.load(f)
     center_list = center_data["center_list"]
 
-    radius = 5 #hyperparameter
     for center in center_list:
         longitude, latitude, _ = center
         pixel_x = int((longitude - upper_left_x) / x_scale)
         pixel_y = int((latitude - upper_left_y) / y_scale)
 
         if 0 <= pixel_x < mask.shape[1] and 0 <= pixel_y < mask.shape[0]:
-            cv2.circle(mask, (pixel_x, pixel_y), radius, 255, thickness=-1)
+            cv2.circle(mask, (pixel_x, pixel_y), RADIUS, 255, thickness=-1)
 
+    # Save the mask as a JPEG image
     cv2.imwrite(output_mask_path, mask)
     print(f"Mask saved to {output_mask_path}")
 
 
-def save_tile_as_tif(tile, output_path, geo_transform, projection):
+def generate_jpeg_tiles_with_opencv(tif_path, output_dir, target_size=512, stride=256):
     """
-    Save a single tile as a Float32 GeoTIFF using GDAL.
+    Generate JPEG tiles from the input .tif file using OpenCV.
     """
-    driver = gdal.GetDriverByName('GTiff')
-    rows, cols = tile.shape
-    dataset = driver.Create(output_path, cols, rows, 1, gdal.GDT_Float32)
-    dataset.SetGeoTransform(geo_transform)
-    dataset.SetProjection(projection)
+    # Read the .tif file using OpenCV
+    img = cv2.imread(tif_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Unable to read TIF file: {tif_path}")
 
-    band = dataset.GetRasterBand(1)
-    band.WriteArray(tile)
-    band.SetNoDataValue(-9999)  # Optional: Set no-data value if needed
-    dataset.FlushCache()
-
-def generate_float32_tiles(tif_path, output_dir, target_size=512, stride=256):
-    """
-    Generate tiles as 32-bit Float GeoTIFFs with overlap.
-    """
-    dataset = gdal.Open(tif_path)
-    img = dataset.ReadAsArray()
-    geo_transform = dataset.GetGeoTransform()
-    projection = dataset.GetProjection()
+    # Ensure multi-band compatibility
+    if len(img.shape) == 2:  # Single-band image
+        img = np.expand_dims(img, axis=-1)
 
     os.makedirs(output_dir, exist_ok=True)
     k = 0
@@ -89,35 +79,39 @@ def generate_float32_tiles(tif_path, output_dir, target_size=512, stride=256):
             y_end = min(y + target_size, img.shape[0])
             x_end = min(x + target_size, img.shape[1])
 
-            tile = img[y:y_end, x:x_end]
+            # extract tile
+            tile = img[y:y_end, x:x_end, :]
 
-            # Update geotransform for the tile
-            tile_geo_transform = (
-                geo_transform[0] + x * geo_transform[1],
-                geo_transform[1],
-                geo_transform[2],
-                geo_transform[3] + y * geo_transform[5],
-                geo_transform[4],
-                geo_transform[5]
-            )
+            # pad tile if necessary
+            if tile.shape[0] < target_size or tile.shape[1] < target_size:
+                padded_tile = np.zeros((target_size, target_size, tile.shape[2]), dtype=tile.dtype)
+                padded_tile[:tile.shape[0], :tile.shape[1], :] = tile
+                tile = padded_tile
 
-            # Save the tile
-            tile_output_path = os.path.join(output_dir, f"tile_{k}.tif")
-            save_tile_as_tif(tile, tile_output_path, tile_geo_transform, projection)
+            # normalize tile for visualization (scale to 0-255)
+            tile_normalized = cv2.normalize(tile, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+            # save as JPEG
+            tile_output_path = os.path.join(output_dir, f"tile_{k}.jpg")
+            cv2.imwrite(tile_output_path, tile_normalized)
             k += 1
 
-    print(f"Float32 tiles saved in {output_dir}")
+    print(f"JPEG tiles saved in {output_dir}")
 
-# main batch processing function
+
 def process_observations(obs_dir: str, output_dir: str):
+    """
+    Main processing function to handle multiple observations.
+    """
     os.makedirs(output_dir, exist_ok=True)
-    observation_folders = glob.glob(os.path.join(obs_dir, "*"))
+    observation_folders = [f for f in os.listdir(obs_dir) if os.path.isdir(os.path.join(obs_dir, f))]
 
     for obs_folder in observation_folders:
-        obs_name = os.path.basename(obs_folder)
-        tif_path = os.path.join(obs_folder, GSDDSM_TIF_FILE)
-        tfw_path = os.path.join(obs_folder, GSDDSM_TFW_FILE)
-        json_path = os.path.join(obs_folder, CENTERS_JSON_FILE)
+        obs_folder_path = os.path.join(obs_dir, obs_folder)
+        obs_name = os.path.basename(obs_folder_path)
+        tif_path = os.path.join(obs_folder_path, GSDDSM_TIF_FILE)
+        tfw_path = os.path.join(obs_folder_path, GSDDSM_TFW_FILE)
+        json_path = os.path.join(obs_folder_path, CENTERS_JSON_FILE)
 
         if not (os.path.exists(tif_path) and os.path.exists(tfw_path) and os.path.exists(json_path)):
             print(f"Skipping {obs_name}: Missing required files.")
@@ -126,13 +120,14 @@ def process_observations(obs_dir: str, output_dir: str):
         obs_output_dir = os.path.join(output_dir, obs_name)
         os.makedirs(obs_output_dir, exist_ok=True)
 
-        # generate mask
-        mask_path = os.path.join(obs_output_dir, "mask.png")
+        # Generate mask
+        mask_path = os.path.join(obs_output_dir, "mask.jpg")
         generate_mask(tif_path, tfw_path, json_path, mask_path)
 
-        # generate segments
-        segments_dir = os.path.join(obs_output_dir, "segments")
-        generate_float32_tiles(tif_path, segments_dir)
+        # Generate tiles
+        tiles_dir = os.path.join(obs_output_dir, "tiles")
+        generate_jpeg_tiles_with_opencv(tif_path, tiles_dir, target_size=TARGET_SIZE, stride=STRIDE)
 
-# run batch processing
+
+# Run batch processing
 process_observations(OBSERVATION_DIR, OUTPUT_DIR)
