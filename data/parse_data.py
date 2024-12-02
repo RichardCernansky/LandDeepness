@@ -57,36 +57,56 @@ def generate_mask(tif_path: str, tfw_path: str, json_path: str, output_mask_path
     print(f"Mask saved to {output_mask_path}")
 
 
-# function to generate tiled segments with overlap
-def generate_segments_overlap(tif_path: str, mask_path: str, output_dir: str, target_size=512, stride=256):
+def save_tile_as_tif(tile, output_path, geo_transform, projection):
     """
-    generate tiled segments with overlap from the input image and mask.
-    for now, it ignores the remaining pixels at the edges (in the last iteration)
-    args:
-        tif_path - path to the input image (TIF file).
-        mask_path - path to the corresponding mask.
-        output_dir - directory where the segments will be saved.
-        target_size - size of each tile.
-        stride - step size for sliding window (overlap if stride < target_size).
+    Save a single tile as a Float32 GeoTIFF using GDAL.
     """
-    img = read_tif_with_gdal(tif_path)
-    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)  # read mask as grayscale
+    driver = gdal.GetDriverByName('GTiff')
+    rows, cols = tile.shape
+    dataset = driver.Create(output_path, cols, rows, 1, gdal.GDT_Float32)
+    dataset.SetGeoTransform(geo_transform)
+    dataset.SetProjection(projection)
+
+    band = dataset.GetRasterBand(1)
+    band.WriteArray(tile)
+    band.SetNoDataValue(-9999)  # Optional: Set no-data value if needed
+    dataset.FlushCache()
+
+def generate_float32_tiles(tif_path, output_dir, target_size=512, stride=256):
+    """
+    Generate tiles as 32-bit Float GeoTIFFs with overlap.
+    """
+    dataset = gdal.Open(tif_path)
+    img = dataset.ReadAsArray()
+    geo_transform = dataset.GetGeoTransform()
+    projection = dataset.GetProjection()
 
     os.makedirs(output_dir, exist_ok=True)
     k = 0
-    for y in range(0, img.shape[0] - target_size + 1, stride):
-        for x in range(0, img.shape[1] - target_size + 1, stride):
-            img_tile = img[y:y + target_size, x:x + target_size]
-            mask_tile = mask[y:y + target_size, x:x + target_size]
 
-            if img_tile.shape[0] == target_size and img_tile.shape[1] == target_size:
-                out_img_path = os.path.join(output_dir, f"tile_{k}_img.jpg")
-                out_mask_path = os.path.join(output_dir, f"tile_{k}_mask.png")
-                cv2.imwrite(out_img_path, img_tile)
-                cv2.imwrite(out_mask_path, mask_tile)
-                k += 1
+    for y in range(0, img.shape[0], stride):
+        for x in range(0, img.shape[1], stride):
+            y_end = min(y + target_size, img.shape[0])
+            x_end = min(x + target_size, img.shape[1])
 
-    print(f"Segments with overlap saved in {output_dir}")
+            tile = img[y:y_end, x:x_end]
+
+            # Update geotransform for the tile
+            tile_geo_transform = (
+                geo_transform[0] + x * geo_transform[1],
+                geo_transform[1],
+                geo_transform[2],
+                geo_transform[3] + y * geo_transform[5],
+                geo_transform[4],
+                geo_transform[5]
+            )
+
+            # Save the tile
+            tile_output_path = os.path.join(output_dir, f"tile_{k}.tif")
+            save_tile_as_tif(tile, tile_output_path, tile_geo_transform, projection)
+            k += 1
+
+    print(f"Float32 tiles saved in {output_dir}")
 
 # main batch processing function
 def process_observations(obs_dir: str, output_dir: str):
@@ -112,7 +132,7 @@ def process_observations(obs_dir: str, output_dir: str):
 
         # generate segments
         segments_dir = os.path.join(obs_output_dir, "segments")
-        generate_segments_overlap(tif_path, mask_path, segments_dir)
+        generate_float32_tiles(tif_path, segments_dir)
 
 # run batch processing
 process_observations(OBSERVATION_DIR, OUTPUT_DIR)
