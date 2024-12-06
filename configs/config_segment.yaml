@@ -1,0 +1,19 @@
+# Path: configs/config_segment.yaml
+data:
+  train_images: "./dataset/train/images"
+  train_masks: "./dataset/train/masks"
+  val_images: "./dataset/val/images"
+  val_masks: "./dataset/val/masks"
+
+training:
+  batch_size: 16
+  epochs: 20
+  img_size: 512
+  learning_rate: 0.001
+  model_name: "resnet34"  # Encoder backbone for U-Net
+  num_classes: 1
+  optimizer: "adam"
+
+output:
+  model_path: "./models/rodent_hole_segmentation.pth"
+  onnx_path: "./models/rodent_hole_segmentation.onnx"
